@@ -31,7 +31,7 @@ TeleDrive can be run directly from Google Colab.
 
 ### Open in Google Colab
 
-[Open TeleDrive in Google Colab](https://colab.research.google.com/github/AbdoNode/TeleDrive/blob/main/TeleDrive_v2.ipynb)
+[Open TeleDrive in Google Colab](https://colab.research.google.com/github/AbdoNode/TeleDrive/blob/main/TeleDrive_V2.ipynb)
 
 The notebook handles the basic installation and Google authentication required by the project.
 
