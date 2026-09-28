@@ -2,63 +2,199 @@ import libtorrent as lt
 import time
 import os
 import sys
-from config import TORRENT_SESSION_FILE, TORRENT_DOWNLOAD_PATH, get_logger
+
+from config import (
+    TORRENT_SESSION_FILE,
+    TORRENT_DOWNLOAD_PATH,
+    get_logger
+)
 
 logger = get_logger(__name__)
 
 
-# التحقق مما إذا كان البرنامج يعمل داخل Google Colab
-try:
-    from google.colab import files
-    IN_COLAB = True
-except ImportError:
-    IN_COLAB = False
-
+# ============================================================
+# Session Management
+# ============================================================
 
 def save_session(session, session_file=TORRENT_SESSION_FILE):
-    """حفظ حالة جلسة التحميل لاستكمالها لاحقًا (يتم حفظ البيانات الثنائية بشكل صحيح)."""
+    """
+    Save the current libtorrent session state.
+    """
+
     try:
         with open(session_file, "wb") as f:
             session_state = session.save_state()
             f.write(lt.bencode(session_state))
 
-        logger.debug(f"تم حفظ الجلسة في {session_file}")
+        logger.debug(
+            f"Session saved to {session_file}"
+        )
 
     except Exception as e:
-        logger.error(f"فشل حفظ الجلسة: {e}")
+        logger.error(
+            f"Failed to save session: {e}"
+        )
 
 
 def load_session(session_file=TORRENT_SESSION_FILE):
-    """تحميل حالة الجلسة إذا كانت موجودة، وإلا إنشاء جلسة جديدة."""
+    """
+    Load a previously saved libtorrent session.
+
+    If the session file is missing or invalid,
+    create a new session.
+    """
 
     if os.path.exists(session_file):
+
         try:
             with open(session_file, "rb") as f:
                 session_data = f.read()
 
-                if not session_data:
-                    raise ValueError("ملف الجلسة فارغ.")
-
-                session_state = lt.bdecode(session_data)
-
-                ses = lt.session()
-                ses.load_state(session_state)
-
-                logger.info(
-                    f"تم تحميل الجلسة من {session_file}"
+            if not session_data:
+                raise ValueError(
+                    "Session file is empty."
                 )
 
-                return ses
-
-        except (RuntimeError, ValueError) as e:
-            logger.warning(
-                f"فشل تحميل الجلسة ({e}). سيتم بدء جلسة جديدة."
+            session_state = lt.bdecode(
+                session_data
             )
 
-            os.remove(session_file)
+            ses = lt.session()
+
+            ses.load_state(
+                session_state
+            )
+
+            logger.info(
+                f"Loaded session from {session_file}"
+            )
+
+            return ses
+
+        except (
+            RuntimeError,
+            ValueError,
+            Exception
+        ) as e:
+
+            logger.warning(
+                f"Failed to load session ({e}). "
+                "Starting a new session."
+            )
+
+            try:
+                os.remove(session_file)
+            except OSError:
+                pass
 
     return lt.session()
 
+
+# ============================================================
+# Formatting Helpers
+# ============================================================
+
+def format_speed(bytes_per_second):
+    """
+    Convert bytes/second to a human-readable speed.
+    """
+
+    value = max(0, int(bytes_per_second))
+
+    if value >= 1024 ** 3:
+        return f"{value / (1024 ** 3):.2f} GB/s"
+
+    if value >= 1024 ** 2:
+        return f"{value / (1024 ** 2):.2f} MB/s"
+
+    if value >= 1024:
+        return f"{value / 1024:.2f} KB/s"
+
+    return f"{value} B/s"
+
+
+def format_size(size):
+    """
+    Convert bytes to a human-readable size.
+    """
+
+    value = max(0, int(size))
+
+    if value >= 1024 ** 4:
+        return f"{value / (1024 ** 4):.2f} TB"
+
+    if value >= 1024 ** 3:
+        return f"{value / (1024 ** 3):.2f} GB"
+
+    if value >= 1024 ** 2:
+        return f"{value / (1024 ** 2):.2f} MB"
+
+    if value >= 1024:
+        return f"{value / 1024:.2f} KB"
+
+    return f"{value} B"
+
+
+def format_eta(seconds):
+    """
+    Convert ETA seconds to a readable string.
+    """
+
+    seconds = int(seconds)
+
+    if seconds <= 0:
+        return "Unknown"
+
+    hours, remainder = divmod(
+        seconds,
+        3600
+    )
+
+    minutes, seconds = divmod(
+        remainder,
+        60
+    )
+
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+
+    if minutes > 0:
+        return f"{minutes}m {seconds}s"
+
+    return f"{seconds}s"
+
+
+def create_progress_bar(
+    percent,
+    length=30
+):
+    """
+    Create a terminal progress bar.
+    """
+
+    percent = max(
+        0.0,
+        min(100.0, float(percent))
+    )
+
+    filled = int(
+        length * percent / 100
+    )
+
+    filled = max(
+        0,
+        min(length, filled)
+    )
+
+    return (
+        "█" * filled
+        + "░" * (length - filled)
+    )
+
+
+# ============================================================
+# Torrent Download
+# ============================================================
 
 def download_torrent(
     source,
@@ -67,239 +203,348 @@ def download_torrent(
     auto_resume=True
 ):
     """
-    تحميل ملف Torrent باستخدام libtorrent
-    مع دعم الإيقاف والاستكمال.
+    Download a torrent using libtorrent.
 
-    :param source:
-        مسار ملف .torrent أو رابط Magnet.
-
-    :param download_path:
-        المجلد الذي سيتم حفظ المحتوى الذي تم تحميله بداخله.
-
-    :param session_file:
-        الملف المستخدم لحفظ وتحميل حالة جلسة التحميل.
-
-    :param auto_resume:
-        تحميل الجلسة السابقة تلقائيًا إذا كانت متاحة.
-
-    :return:
-        مسار المحتوى الذي تم تحميله، أو None في حالة فشل العملية.
+    Supports:
+    - .torrent files
+    - Magnet links
+    - Session saving
+    - Automatic resume
+    - Telegram-friendly progress output
     """
 
-    if not os.path.exists(download_path):
-        os.makedirs(download_path)
+    # --------------------------------------------------------
+    # Prepare download directory
+    # --------------------------------------------------------
 
-        logger.info(
-            f"تم إنشاء مجلد التحميل: {download_path}"
+    if not os.path.exists(download_path):
+
+        os.makedirs(
+            download_path,
+            exist_ok=True
         )
 
-    # التحقق مما إذا كان سيتم استكمال جلسة تحميل سابقة
-    is_resuming = (
-        auto_resume
-        and os.path.exists(session_file)
-    )
+        logger.info(
+            f"Created download directory: {download_path}"
+        )
 
-    # تحميل الجلسة الحالية أو إنشاء جلسة جديدة
+    # --------------------------------------------------------
+    # Load or create session
+    # --------------------------------------------------------
+
     ses = (
         load_session(session_file)
         if auto_resume
         else lt.session()
     )
 
-    # تطبيق الإعدادات المطلوبة
+    # --------------------------------------------------------
+    # Session settings
+    # --------------------------------------------------------
+
     settings = {
-        'listen_interfaces': '0.0.0.0:6881',
+        "listen_interfaces": "0.0.0.0:6881"
     }
 
-    ses.apply_settings(settings)
+    ses.apply_settings(
+        settings
+    )
 
-    # تهيئة إعدادات إضافة Torrent
+    # --------------------------------------------------------
+    # Torrent parameters
+    # --------------------------------------------------------
+
     params = lt.add_torrent_params()
 
     params.save_path = download_path
+
     params.storage_mode = (
         lt.storage_mode_t.storage_mode_sparse
     )
 
-    # التعامل مع رابط Magnet أو ملف .torrent
+    # --------------------------------------------------------
+    # Add Magnet or Torrent file
+    # --------------------------------------------------------
+
     if source.startswith("magnet:"):
 
         params.url = source
 
         logger.info(
-            f"إضافة رابط Magnet: {source[:60]}..."
+            "Adding Magnet link..."
         )
 
-    elif source.endswith(".torrent"):
+    elif source.lower().endswith(".torrent"):
 
         if not os.path.exists(source):
+
             logger.error(
-                f"ملف Torrent غير موجود: {source}"
+                f"Torrent file not found: {source}"
             )
+
             return None
 
         try:
-            with open(source, "rb") as f:
-                torrent_data = lt.bdecode(f.read())
-                info = lt.torrent_info(torrent_data)
-                params.ti = info
+
+            with open(
+                source,
+                "rb"
+            ) as f:
+
+                torrent_data = lt.bdecode(
+                    f.read()
+                )
+
+            info = lt.torrent_info(
+                torrent_data
+            )
+
+            params.ti = info
 
             logger.info(
-                f"إضافة ملف Torrent: {source}"
+                f"Adding torrent file: {source}"
             )
 
         except Exception as e:
+
             logger.error(
-                f"فشل قراءة ملف Torrent: {e}"
+                f"Failed to read torrent file: {e}"
             )
+
             return None
 
     else:
+
         logger.error(
-            "مصدر غير صالح. "
-            "يرجى توفير ملف .torrent أو رابط Magnet."
+            "Invalid source. "
+            "Please provide a .torrent file "
+            "or a Magnet link."
         )
+
         return None
 
-    # إضافة Torrent إلى جلسة التحميل
+    # --------------------------------------------------------
+    # Add torrent to session
+    # --------------------------------------------------------
+
     try:
-        handle = ses.add_torrent(params)
+
+        handle = ses.add_torrent(
+            params
+        )
 
         logger.info(
-            f"التحميل إلى: {download_path}"
+            f"Download location: {download_path}"
         )
 
     except Exception as e:
+
         logger.error(
-            f"فشل إضافة Torrent: {e}"
+            f"Failed to add torrent: {e}"
         )
+
         return None
 
-    # انتظار الحصول على بيانات Torrent
-    logger.info("في انتظار بيانات Torrent...")
-
-    while not handle.status().has_metadata:
-        time.sleep(1)
-
-    torrent_name = handle.status().name
+    # --------------------------------------------------------
+    # Wait for metadata
+    # --------------------------------------------------------
 
     logger.info(
-        f"جاري التحميل: {torrent_name}"
+        "Waiting for torrent metadata..."
     )
+
+    metadata_start = time.time()
+
+    while not handle.status().has_metadata:
+
+        print(
+            "\rTD_STATUS status=waiting_metadata",
+            end="",
+            flush=True
+        )
+
+        time.sleep(1)
+
+        # Safety timeout:
+        # keep the torrent alive but report status.
+        if time.time() - metadata_start >= 10:
+
+            logger.info(
+                "Still waiting for torrent metadata..."
+            )
+
+            metadata_start = time.time()
+
+    # --------------------------------------------------------
+    # Torrent information
+    # --------------------------------------------------------
+
+    status = handle.status()
+
+    torrent_name = status.name
+
+    logger.info(
+        f"Starting download: {torrent_name}"
+    )
+
+    # --------------------------------------------------------
+    # Download loop
+    # --------------------------------------------------------
 
     try:
 
-        while (
-            handle.status().state
-            != lt.torrent_status.seeding
-        ):
+        while True:
 
             s = handle.status()
 
-            progress = s.progress * 100
+            # ------------------------------------------------
+            # Stop when torrent is completely downloaded
+            # ------------------------------------------------
 
-            # حساب الوقت المتبقي للتحميل
-            eta_str = "غير معروف"
-
-            if s.download_rate > 0:
-
-                total_size = s.total_wanted
-                downloaded = s.total_done
-                remaining = total_size - downloaded
-
-                eta_seconds = (
-                    remaining / s.download_rate
-                )
-
-                if eta_seconds < 60:
-                    eta_str = f"{int(eta_seconds)}ث"
-
-                elif eta_seconds < 3600:
-                    eta_str = (
-                        f"{int(eta_seconds / 60)}د "
-                        f"{int(eta_seconds % 60)}ث"
-                    )
-
-                else:
-                    hours = int(
-                        eta_seconds / 3600
-                    )
-
-                    minutes = int(
-                        (eta_seconds % 3600) / 60
-                    )
-
-                    eta_str = (
-                        f"{hours}س {minutes}د"
-                    )
-
-            # تنسيق سرعة التحميل
-            if s.download_rate > 1024 * 1024:
-                speed_str = (
-                    f"{s.download_rate / (1024 * 1024):.2f} MB/s"
-                )
-            else:
-                speed_str = (
-                    f"{s.download_rate / 1024:.2f} KB/s"
-                )
-
-            # إنشاء شريط التقدم يدويًا
-            bar_length = 30
-
-            filled_length = int(
-                bar_length * progress / 100
-            )
-
-            bar = (
-                '█' * filled_length
-                + '░' * (
-                    bar_length - filled_length
-                )
-            )
-
-            # تحديد اسم الحالة بناءً على الحالة الفعلية
-            if is_resuming and progress < 95:
-
-                label = "استكمال التحميل"
-
-            elif (
-                s.download_rate == 0
-                and s.num_peers == 0
+            if (
+                s.state
+                == lt.torrent_status.seeding
             ):
 
-                label = "جاري الاتصال بالمصادر"
+                break
+
+            # ------------------------------------------------
+            # Real libtorrent statistics
+            # ------------------------------------------------
+
+            progress = max(
+                0.0,
+                min(
+                    100.0,
+                    float(s.progress) * 100.0
+                )
+            )
+
+            download_rate = max(
+                0,
+                int(s.download_rate)
+            )
+
+            upload_rate = max(
+                0,
+                int(s.upload_rate)
+            )
+
+            seeds = max(
+                0,
+                int(s.num_seeds)
+            )
+
+            peers = max(
+                0,
+                int(s.num_peers)
+            )
+
+            total_size = max(
+                0,
+                int(s.total_wanted)
+            )
+
+            downloaded = max(
+                0,
+                int(s.total_done)
+            )
+
+            remaining = max(
+                0,
+                total_size - downloaded
+            )
+
+            # ------------------------------------------------
+            # ETA
+            # ------------------------------------------------
+
+            if (
+                download_rate > 0
+                and remaining > 0
+            ):
+
+                eta_seconds = int(
+                    remaining / download_rate
+                )
 
             else:
 
-                label = "تقدم التحميل"
+                eta_seconds = 0
 
-                # لم يعد التحميل في وضع الاستكمال
-                # بعد بدء التحميل الفعلي
-                is_resuming = False
+            # ------------------------------------------------
+            # Machine-readable progress
+            #
+            # The Telegram controller should parse
+            # this line instead of parsing arbitrary logs.
+            # ------------------------------------------------
 
-            stats_str = (
-                f"المصادر: {s.num_seeds} | "
-                f"المتصلون: {s.num_peers - s.num_seeds} | "
-                f"السرعة: {speed_str} | "
-                f"الوقت المتبقي: {eta_str}"
-            )
-
-            progress_line = (
-                f"{label}: "
-                f"{bar} "
-                f"{progress:.1f}/100%    | "
-                f"{stats_str}"
-            )
-
-            # استخدام print بدلًا من tqdm لتجنب التداخل
             print(
-                f"\r{progress_line}",
+                "\rTD_PROGRESS "
+                f"percent={progress:.2f} "
+                f"download_bps={download_rate} "
+                f"upload_bps={upload_rate} "
+                f"seeds={seeds} "
+                f"peers={peers} "
+                f"eta_seconds={eta_seconds} "
+                f"downloaded={downloaded} "
+                f"total={total_size}",
                 end="",
                 flush=True
             )
 
-            # حفظ الجلسة بشكل دوري كل 10 ثوانٍ
+            # ------------------------------------------------
+            # Human-readable terminal progress
+            # ------------------------------------------------
+
+            bar = create_progress_bar(
+                progress,
+                30
+            )
+
+            speed_str = format_speed(
+                download_rate
+            )
+
+            upload_str = format_speed(
+                upload_rate
+            )
+
+            eta_str = format_eta(
+                eta_seconds
+            )
+
+            downloaded_str = format_size(
+                downloaded
+            )
+
+            total_str = format_size(
+                total_size
+            )
+
+            progress_line = (
+                f"{bar} "
+                f"{progress:.1f}% | "
+                f"Download: {speed_str} | "
+                f"Upload: {upload_str} | "
+                f"Seeds: {seeds} | "
+                f"Peers: {peers} | "
+                f"ETA: {eta_str} | "
+                f"{downloaded_str}/{total_str}"
+            )
+
+            print(
+                "\r" + progress_line,
+                end="",
+                flush=True
+            )
+
+            # ------------------------------------------------
+            # Save session periodically
+            # ------------------------------------------------
+
             if int(time.time()) % 10 == 0:
+
                 save_session(
                     ses,
                     session_file
@@ -309,12 +554,11 @@ def download_torrent(
 
     except KeyboardInterrupt:
 
-        # الانتقال إلى سطر جديد بعد شريط التقدم
         print()
 
         logger.warning(
-            "تم إيقاف التحميل بواسطة المستخدم. "
-            "تم حفظ الجلسة لاستكمالها لاحقًا."
+            "Download interrupted by user. "
+            "Saving session for resume."
         )
 
         save_session(
@@ -324,28 +568,60 @@ def download_torrent(
 
         return None
 
-    # الانتقال إلى سطر جديد بعد اكتمال شريط التقدم
+    except Exception as e:
+
+        print()
+
+        logger.error(
+            f"Download error: {e}"
+        )
+
+        save_session(
+            ses,
+            session_file
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # Download completed
+    # --------------------------------------------------------
+
     print()
 
-    logger.info("اكتمل التحميل!")
+    logger.info(
+        "Download completed!"
+    )
 
-    # حذف ملف الجلسة بعد اكتمال التحميل بنجاح
-    if os.path.exists(session_file):
+    # --------------------------------------------------------
+    # Remove session file
+    # --------------------------------------------------------
+
+    if os.path.exists(
+        session_file
+    ):
 
         try:
-            os.remove(session_file)
+
+            os.remove(
+                session_file
+            )
 
             logger.debug(
-                "تم حذف ملف الجلسة بعد اكتمال التحميل بنجاح"
+                "Removed session file "
+                "after successful completion."
             )
 
         except Exception as e:
 
             logger.warning(
-                f"تعذر حذف ملف الجلسة: {e}"
+                f"Could not remove session file: {e}"
             )
 
-    # إرجاع مسار المحتوى الذي تم تحميله
+    # --------------------------------------------------------
+    # Return downloaded path
+    # --------------------------------------------------------
+
     downloaded_path = os.path.join(
         download_path,
         torrent_name
@@ -354,39 +630,45 @@ def download_torrent(
     return downloaded_path
 
 
+# ============================================================
+# Session Status
+# ============================================================
+
 def get_download_status(
     session_file=TORRENT_SESSION_FILE
 ):
     """
-    التحقق مما إذا كان هناك تحميل متوقف
-    يمكن استكماله.
-
-    :return:
-        True إذا كان ملف الجلسة موجودًا،
-        وFalse إذا لم يكن موجودًا.
+    Return True if a resumable session exists.
     """
 
-    return os.path.exists(session_file)
+    return os.path.exists(
+        session_file
+    )
 
+
+# ============================================================
+# Clear Session
+# ============================================================
 
 def clear_session(
     session_file=TORRENT_SESSION_FILE
 ):
     """
-    حذف ملف الجلسة لبدء تحميل جديد.
-
-    :return:
-        True إذا تم الحذف بنجاح،
-        وFalse إذا فشلت العملية.
+    Delete the saved torrent session.
     """
 
-    if os.path.exists(session_file):
+    if os.path.exists(
+        session_file
+    ):
 
         try:
-            os.remove(session_file)
+
+            os.remove(
+                session_file
+            )
 
             logger.info(
-                "تم مسح ملف الجلسة"
+                "Download session cleared."
             )
 
             return True
@@ -394,7 +676,7 @@ def clear_session(
         except Exception as e:
 
             logger.error(
-                f"فشل مسح الجلسة: {e}"
+                f"Failed to clear session: {e}"
             )
 
             return False
@@ -402,13 +684,17 @@ def clear_session(
     return True
 
 
+# ============================================================
+# Standalone Execution
+# ============================================================
+
 if __name__ == "__main__":
 
     if len(sys.argv) < 2:
 
         print(
-            "الاستخدام: "
-            "python torrent_downloader.py "
+            "Usage:\n"
+            "  python torrent_downloader.py "
             "<torrent_file/magnet_link>"
         )
 
@@ -416,12 +702,15 @@ if __name__ == "__main__":
 
     source = sys.argv[1]
 
-    result = download_torrent(source)
+    result = download_torrent(
+        source
+    )
 
     if result:
 
         print(
-            f"\nتم التحميل إلى: {result}"
+            f"\nDownload completed successfully:\n"
+            f"{result}"
         )
 
         sys.exit(0)
